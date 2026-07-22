@@ -9,6 +9,7 @@
  * Run directly: bun broker.ts
  */
 
+import { homedir } from "node:os";
 import { Database } from "bun:sqlite";
 import type {
   RegisterRequest,
@@ -21,10 +22,13 @@ import type {
   PollMessagesResponse,
   Peer,
   Message,
+  RegisterVirtualPeerRequest,
+  RegisterVirtualPeerResponse,
+  UnregisterVirtualPeerRequest,
 } from "./shared/types.ts";
 
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
-const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peers.db`;
+const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${homedir()}/.claude-peers.db`;
 
 // --- Database setup ---
 
@@ -45,6 +49,22 @@ db.run(`
   )
 `);
 
+// B1: virtual peer columns (additive migration — safe on existing DBs)
+function ensureColumn(table: string, column: string, decl: string) {
+  const cols = db.query(`PRAGMA table_info(${table})`).all() as { name: string }[];
+  if (!cols.some((c) => c.name === column)) {
+    db.run(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
+  }
+}
+ensureColumn("peers", "virtual_peer", "INTEGER NOT NULL DEFAULT 0");
+ensureColumn("peers", "parent_id", "TEXT");
+ensureColumn("peers", "role", "TEXT");
+
+// Index for fast lookup of virtual peers by (parent_id, role)
+db.run(
+  `CREATE INDEX IF NOT EXISTS idx_peers_parent_role ON peers (parent_id, role)`
+);
+
 db.run(`
   CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -58,19 +78,89 @@ db.run(`
   )
 `);
 
-// Clean up stale peers (PIDs that no longer exist) on startup
+// Day56 stale-cleanup grace-ification (ack-based delivery safety).
+// With ack-based delivery, undelivered messages are NORMAL (a peer that is busy/mid-turn
+// legitimately has queued, un-acked messages). The old immediate delete-on-first-PID-failure
+// could wipe a LIVE session's inbox on a transient PID mis-read (EPERM etc.). So:
+//   (a) A peer is only removed once we are confident it is gone: PID check must fail
+//       MAX_PID_FAILURES times consecutively AND its last_seen must be older than the
+//       grace window (a live session heartbeats every 15s, so last_seen stays fresh and
+//       it is never removed no matter how the PID check flakes).
+//   (b) Undelivered messages are NOT deleted together with the peer. Instead a separate
+//       grace sweep removes only undelivered messages that are BOTH older than
+//       MESSAGE_GRACE_MS AND addressed to a peer that no longer exists — so a live peer's
+//       queued messages are never touched.
+const PID_GRACE_MS = 90_000; // last_seen must be older than this before a PID-failed peer is removed
+const MAX_PID_FAILURES = 3; // consecutive PID-check failures required before removal
+const MESSAGE_GRACE_MS = 5 * 60_000; // undelivered messages younger than this are kept even if recipient is gone
+
+// Consecutive PID-check failure counter per peer id (reset to 0 on any successful check).
+const pidFailureCounts = new Map<string, number>();
+
 function cleanStalePeers() {
-  const peers = db.query("SELECT id, pid FROM peers").all() as { id: string; pid: number }[];
+  const now = Date.now();
+  const peers = db
+    .query("SELECT id, pid, virtual_peer, parent_id, last_seen FROM peers")
+    .all() as {
+    id: string;
+    pid: number;
+    virtual_peer: number;
+    parent_id: string | null;
+    last_seen: string;
+  }[];
+  const alive = new Set<string>();
+  const removed = new Set<string>();
+
+  // Decide removal per peer: PID must be confirmed dead (N consecutive failures) AND stale.
+  function removalConfirmed(peer: { id: string; last_seen: string }): boolean {
+    const failures = (pidFailureCounts.get(peer.id) ?? 0) + 1;
+    pidFailureCounts.set(peer.id, failures);
+    const lastSeenMs = Date.parse(peer.last_seen);
+    const staleForMs = Number.isNaN(lastSeenMs) ? Infinity : now - lastSeenMs;
+    return failures >= MAX_PID_FAILURES && staleForMs > PID_GRACE_MS;
+  }
+
   for (const peer of peers) {
     try {
       // Check if process is still alive (signal 0 doesn't kill, just checks)
       process.kill(peer.pid, 0);
+      alive.add(peer.id);
+      pidFailureCounts.set(peer.id, 0); // reset on success
     } catch {
-      // Process doesn't exist, remove it
-      db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
-      db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
+      // Process appears dead — but only remove after grace (N failures + last_seen stale)
+      if (removalConfirmed(peer)) {
+        db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
+        pidFailureCounts.delete(peer.id);
+        removed.add(peer.id);
+      }
     }
   }
+
+  // Orphan-virtual-peer sweep: any virtual peer whose parent was actually removed
+  // (parent gone AND not merely mid-grace). Parents still within grace keep their children.
+  for (const peer of peers) {
+    if (
+      peer.virtual_peer === 1 &&
+      peer.parent_id &&
+      !alive.has(peer.parent_id) &&
+      removed.has(peer.parent_id)
+    ) {
+      db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
+      pidFailureCounts.delete(peer.id);
+      removed.add(peer.id);
+    }
+  }
+
+  // (b) Grace sweep for undelivered messages: only drop ones that are old AND orphaned
+  // (recipient peer no longer exists). Never touches messages for a still-registered peer.
+  const messageCutoff = new Date(now - MESSAGE_GRACE_MS).toISOString();
+  db.run(
+    `DELETE FROM messages
+     WHERE delivered = 0
+       AND sent_at < ?
+       AND to_id NOT IN (SELECT id FROM peers)`,
+    [messageCutoff]
+  );
 }
 
 cleanStalePeers();
@@ -78,15 +168,47 @@ cleanStalePeers();
 // Periodically clean stale peers (every 30s)
 setInterval(cleanStalePeers, 30_000);
 
+// P2: Self-watchdog — exit if no endpoint hit refreshes lastHealthOk within window (Day52 hang prevention)
+// refresh trigger: /health endpoint OR /heartbeat OR /poll-messages (natural request flow)
+// threshold 5min (60s was too aggressive: false self-exit when /health had no natural caller)
+let lastHealthOk = Date.now();
+setInterval(() => {
+  const stale = Date.now() - lastHealthOk;
+  if (stale > 1_800_000) {
+    console.error(`[broker] self-watchdog detected stale ${stale}ms since last endpoint hit (5min threshold exceeded), exiting`);
+    process.exit(1);
+  }
+}, 10_000);
+
+// P3: Force SQLite WAL checkpoint every hour (Day52 WAL file 肥大化 prevention)
+setInterval(() => {
+  try {
+    db.run("PRAGMA wal_checkpoint(TRUNCATE)");
+    console.error(`[broker] WAL checkpoint executed`);
+  } catch (e) {
+    console.error(`[broker] WAL checkpoint failed: ${e}`);
+  }
+}, 60 * 60 * 1000);
+
 // --- Prepared statements ---
 
 const insertPeer = db.prepare(`
-  INSERT INTO peers (id, pid, cwd, git_root, tty, summary, registered_at, last_seen)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO peers (id, pid, cwd, git_root, tty, summary, registered_at, last_seen, virtual_peer, parent_id, role)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL)
+`);
+
+const insertVirtualPeer = db.prepare(`
+  INSERT INTO peers (id, pid, cwd, git_root, tty, summary, registered_at, last_seen, virtual_peer, parent_id, role)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
 `);
 
 const updateLastSeen = db.prepare(`
   UPDATE peers SET last_seen = ? WHERE id = ?
+`);
+
+// Heartbeat for parent also bumps its virtual children (so they stay "fresh").
+const updateChildrenLastSeen = db.prepare(`
+  UPDATE peers SET last_seen = ? WHERE parent_id = ? AND virtual_peer = 1
 `);
 
 const updateSummary = db.prepare(`
@@ -95,6 +217,18 @@ const updateSummary = db.prepare(`
 
 const deletePeer = db.prepare(`
   DELETE FROM peers WHERE id = ?
+`);
+
+const deleteVirtualChildren = db.prepare(`
+  DELETE FROM peers WHERE parent_id = ? AND virtual_peer = 1
+`);
+
+const selectVirtualByParentRole = db.prepare(`
+  SELECT * FROM peers WHERE parent_id = ? AND role = ? AND virtual_peer = 1
+`);
+
+const selectParentPeer = db.prepare(`
+  SELECT * FROM peers WHERE id = ? AND virtual_peer = 0
 `);
 
 const selectAllPeers = db.prepare(`
@@ -139,9 +273,13 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
   const id = generateId();
   const now = new Date().toISOString();
 
-  // Remove any existing registration for this PID (re-registration)
-  const existing = db.query("SELECT id FROM peers WHERE pid = ?").get(body.pid) as { id: string } | null;
+  // Remove any existing real (non-virtual) registration for this PID (re-registration).
+  // Virtual peers under that old parent are cascade-removed by parent_id.
+  const existing = db
+    .query("SELECT id FROM peers WHERE pid = ? AND virtual_peer = 0")
+    .get(body.pid) as { id: string } | null;
   if (existing) {
+    deleteVirtualChildren.run(existing.id);
     deletePeer.run(existing.id);
   }
 
@@ -150,34 +288,122 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
 }
 
 function handleHeartbeat(body: HeartbeatRequest): void {
-  updateLastSeen.run(new Date().toISOString(), body.id);
+  const now = new Date().toISOString();
+  updateLastSeen.run(now, body.id);
+  // Cascade heartbeat to virtual children so they don't appear stale.
+  updateChildrenLastSeen.run(now, body.id);
+  // P2: refresh self-watchdog (natural request flow indicates event loop is live)
+  lastHealthOk = Date.now();
+}
+
+function handleRegisterVirtualPeer(
+  body: RegisterVirtualPeerRequest
+): RegisterVirtualPeerResponse {
+  if (!body.parent_id || !body.role) {
+    throw new Error("parent_id and role are required");
+  }
+  // Idempotent: if a virtual peer with this (parent_id, role) already exists, return it.
+  const existing = selectVirtualByParentRole.get(body.parent_id, body.role) as
+    | Peer
+    | null;
+  if (existing) {
+    if (body.summary && body.summary !== existing.summary) {
+      updateSummary.run(body.summary, existing.id);
+    }
+    return { id: existing.id, created: false };
+  }
+
+  // Look up parent to inherit pid/cwd/git_root/tty for liveness + filtering.
+  const parent = selectParentPeer.get(body.parent_id) as Peer | null;
+  if (!parent) {
+    throw new Error(`Parent peer ${body.parent_id} not found (or is itself virtual)`);
+  }
+
+  const id = generateId();
+  const now = new Date().toISOString();
+  const summary = body.summary ?? `[subagent ${body.role}]`;
+  insertVirtualPeer.run(
+    id,
+    parent.pid,
+    parent.cwd,
+    parent.git_root,
+    parent.tty,
+    summary,
+    now,
+    now,
+    body.parent_id,
+    body.role
+  );
+  return { id, created: true };
+}
+
+function handleUnregisterVirtualPeer(body: UnregisterVirtualPeerRequest): void {
+  if (!body.parent_id) {
+    throw new Error("parent_id is required");
+  }
+  if (body.role) {
+    const existing = selectVirtualByParentRole.get(body.parent_id, body.role) as
+      | Peer
+      | null;
+    if (existing) {
+      deletePeer.run(existing.id);
+      db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [existing.id]);
+    }
+  } else {
+    // Unregister all virtual children
+    const children = db
+      .query("SELECT id FROM peers WHERE parent_id = ? AND virtual_peer = 1")
+      .all(body.parent_id) as { id: string }[];
+    for (const c of children) {
+      db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [c.id]);
+    }
+    deleteVirtualChildren.run(body.parent_id);
+  }
 }
 
 function handleSetSummary(body: SetSummaryRequest): void {
   updateSummary.run(body.summary, body.id);
 }
 
+function normalizePeerRow(row: Record<string, unknown>): Peer {
+  return {
+    id: row.id as string,
+    pid: row.pid as number,
+    cwd: row.cwd as string,
+    git_root: (row.git_root ?? null) as string | null,
+    tty: (row.tty ?? null) as string | null,
+    summary: (row.summary ?? "") as string,
+    registered_at: row.registered_at as string,
+    last_seen: row.last_seen as string,
+    virtual_peer: ((row.virtual_peer ?? 0) as number) === 1,
+    parent_id: (row.parent_id ?? null) as string | null,
+    role: (row.role ?? null) as string | null,
+  };
+}
+
 function handleListPeers(body: ListPeersRequest): Peer[] {
-  let peers: Peer[];
+  let rawPeers: Record<string, unknown>[];
 
   switch (body.scope) {
     case "machine":
-      peers = selectAllPeers.all() as Peer[];
+      rawPeers = selectAllPeers.all() as Record<string, unknown>[];
       break;
     case "directory":
-      peers = selectPeersByDirectory.all(body.cwd) as Peer[];
+      rawPeers = selectPeersByDirectory.all(body.cwd) as Record<string, unknown>[];
       break;
     case "repo":
       if (body.git_root) {
-        peers = selectPeersByGitRoot.all(body.git_root) as Peer[];
+        rawPeers = selectPeersByGitRoot.all(body.git_root) as Record<string, unknown>[];
       } else {
         // No git root, fall back to directory
-        peers = selectPeersByDirectory.all(body.cwd) as Peer[];
+        rawPeers = selectPeersByDirectory.all(body.cwd) as Record<string, unknown>[];
       }
       break;
     default:
-      peers = selectAllPeers.all() as Peer[];
+      rawPeers = selectAllPeers.all() as Record<string, unknown>[];
   }
+
+  let peers = rawPeers.map(normalizePeerRow);
 
   // Exclude the requesting peer
   if (body.exclude_id) {
@@ -190,7 +416,10 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
       process.kill(p.pid, 0);
       return true;
     } catch {
-      // Clean up dead peer
+      // Clean up dead peer (and its virtual children if it's a parent)
+      if (!p.virtual_peer) {
+        deleteVirtualChildren.run(p.id);
+      }
       deletePeer.run(p.id);
       return false;
     }
@@ -216,10 +445,42 @@ function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
     markDelivered.run(msg.id);
   }
 
+  // P2: refresh self-watchdog (poll-messages is the highest-frequency endpoint = best liveness signal)
+  lastHealthOk = Date.now();
+
   return { messages };
 }
 
+// Day56 ack-based delivery (Option 1', backward-compatible).
+// /poll-messages-v2: returns undelivered messages but does NOT mark them delivered.
+// The caller must call /ack-message {id} after each message is successfully pushed
+// to the model. If a push fails, the message is left undelivered and re-returned on
+// the next poll (redelivery). Legacy /poll-messages (mark-on-poll) stays untouched
+// so old server.ts sessions keep working until they restart onto v2.
+function handlePollMessagesV2(body: PollMessagesRequest): PollMessagesResponse {
+  const messages = selectUndelivered.all(body.id) as Message[];
+
+  // v2: intentionally do NOT mark delivered here — delivery is confirmed via /ack-message.
+
+  // P2: refresh self-watchdog (v2 poll is now the highest-frequency endpoint on new sessions)
+  lastHealthOk = Date.now();
+
+  return { messages };
+}
+
+// /ack-message: mark a single message delivered after the caller confirmed a successful push.
+function handleAckMessage(body: { id: number }): { ok: boolean } {
+  markDelivered.run(body.id);
+
+  // P2: refresh self-watchdog (natural request flow indicates event loop is live)
+  lastHealthOk = Date.now();
+
+  return { ok: true };
+}
+
 function handleUnregister(body: { id: string }): void {
+  // Cascade-remove any virtual children before deleting the parent
+  deleteVirtualChildren.run(body.id);
   deletePeer.run(body.id);
 }
 
@@ -234,7 +495,8 @@ Bun.serve({
 
     if (req.method !== "POST") {
       if (path === "/health") {
-        return Response.json({ status: "ok", peers: (selectAllPeers.all() as Peer[]).length });
+        lastHealthOk = Date.now();
+        return Response.json({ status: "ok" });
       }
       return new Response("claude-peers broker", { status: 200 });
     }
@@ -257,8 +519,19 @@ Bun.serve({
           return Response.json(handleSendMessage(body as SendMessageRequest));
         case "/poll-messages":
           return Response.json(handlePollMessages(body as PollMessagesRequest));
+        case "/poll-messages-v2":
+          return Response.json(handlePollMessagesV2(body as PollMessagesRequest));
+        case "/ack-message":
+          return Response.json(handleAckMessage(body as { id: number }));
         case "/unregister":
           handleUnregister(body as { id: string });
+          return Response.json({ ok: true });
+        case "/register-virtual-peer":
+          return Response.json(
+            handleRegisterVirtualPeer(body as RegisterVirtualPeerRequest)
+          );
+        case "/unregister-virtual-peer":
+          handleUnregisterVirtualPeer(body as UnregisterVirtualPeerRequest);
           return Response.json({ ok: true });
         default:
           return Response.json({ error: "not found" }, { status: 404 });
